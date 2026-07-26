@@ -103,11 +103,20 @@ body {
     height: auto;
     min-height: 100dvh;
     overflow: visible;
+    /* layout containment makes position:fixed stick to page bottom */
+    container-type: normal;
+  }
+
+  .dock,
+  .tabbar,
+  .music-btn {
+    position: fixed;
   }
 
   .welcome-gate {
+    position: fixed;
     height: 100dvh;
-    bottom: auto;
+    inset: 0;
   }
 }
 
