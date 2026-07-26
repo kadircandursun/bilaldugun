@@ -71,7 +71,7 @@ body {
   background: var(--bg);
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  container-type: size;
+  container-type: inline-size;
   container-name: phone;
 }
 
@@ -103,6 +103,11 @@ body {
     height: auto;
     min-height: 100dvh;
     overflow: visible;
+  }
+
+  .welcome-gate {
+    height: 100dvh;
+    bottom: auto;
   }
 }
 
@@ -732,7 +737,7 @@ button {
 .photo-hero {
   position: relative;
   height: 320px;
-  max-height: 42cqh;
+  max-height: 42dvh;
   min-height: 240px;
   overflow: hidden;
   background: #2a2a28;
