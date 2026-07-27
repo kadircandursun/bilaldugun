@@ -22,6 +22,15 @@ interface CentralEntry {
   offset: number;
 }
 
+interface PartialFile {
+  key: string;
+  name: string;
+  offset: number;
+  size: number;
+  localHeaderOffset: number;
+  bytesWritten: number;
+}
+
 interface ArchiveJob {
   status: JobStatus;
   progressDone: number;
@@ -37,13 +46,12 @@ interface ArchiveJob {
   partNumber?: number;
   zipOffset?: number;
   central?: CentralEntry[];
+  partial?: PartialFile | null;
 }
 
 const PART_BUF_KEY = "archives/_partbuf.bin";
 const MIN_PART = 5 * 1024 * 1024;
-const FILES_PER_TICK = 1;
-const BYTES_PER_TICK = 512 * 1024 * 1024;
-const CRC_MAX_BYTES = 8 * 1024 * 1024;
+const RANGE_PER_TICK = 12 * 1024 * 1024;
 
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -352,6 +360,7 @@ async function tickJob(env: Env): Promise<ArchiveJob> {
   const keys = job.keys || [];
   let index = job.nextIndex || 0;
   const central = job.central || [];
+  let partial = job.partial || null;
   const initialBuf = await loadPartBuf(env);
 
   const writer = new PartWriter(
@@ -364,47 +373,59 @@ async function tickJob(env: Env): Promise<ArchiveJob> {
     initialBuf
   );
 
-  let filesThisTick = 0;
-  let bytesThisTick = 0;
-
   try {
-    while (index < keys.length && filesThisTick < FILES_PER_TICK && bytesThisTick < BYTES_PER_TICK) {
-      const key = keys[index];
-      const file = await env.BUCKET.get(key);
-      const name = key.slice(env.UPLOAD_PREFIX.length) || key;
-      const nameBytes = new TextEncoder().encode(name);
-
-      if (!file || !file.body) {
-        index += 1;
-        filesThisTick += 1;
-        continue;
+    if (!partial) {
+      if (index >= keys.length) {
+        // fall through to finalize below
+      } else {
+        const key = keys[index];
+        const head = await env.BUCKET.head(key);
+        const size = head?.size || 0;
+        const name = key.slice(env.UPLOAD_PREFIX.length) || key;
+        const nameBytes = new TextEncoder().encode(name);
+        const localHeaderOffset = writer.offset;
+        await writer.write(localHeader(nameBytes));
+        partial = {
+          key,
+          name,
+          offset: 0,
+          size,
+          localHeaderOffset,
+          bytesWritten: 0,
+        };
       }
-
-      const offset = writer.offset;
-      await writer.write(localHeader(nameBytes));
-
-      let crc = 0;
-      let size = 0;
-      const computeCrc = (file.size || 0) <= CRC_MAX_BYTES;
-      const reader = file.body.getReader();
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value) continue;
-        if (computeCrc) crc = crc32Update(crc, value);
-        size += value.length;
-        bytesThisTick += value.length;
-        await writer.write(value);
-      }
-
-      await writer.write(dataDescriptor(crc, size));
-      central.push({ name, crc, size, offset });
-
-      index += 1;
-      filesThisTick += 1;
     }
 
-    if (index >= keys.length) {
+    if (partial) {
+      const remaining = partial.size - partial.offset;
+      const length = Math.min(RANGE_PER_TICK, remaining);
+      if (length > 0) {
+        const chunk = await env.BUCKET.get(partial.key, {
+          range: { offset: partial.offset, length },
+        });
+        if (!chunk || !chunk.body) {
+          throw new Error(`Dosya okunamadi: ${partial.key}`);
+        }
+        const buf = new Uint8Array(await chunk.arrayBuffer());
+        await writer.write(buf);
+        partial.offset += buf.length;
+        partial.bytesWritten += buf.length;
+      }
+
+      if (partial.offset >= partial.size) {
+        await writer.write(dataDescriptor(0, partial.size));
+        central.push({
+          name: partial.name,
+          crc: 0,
+          size: partial.size,
+          offset: partial.localHeaderOffset,
+        });
+        index += 1;
+        partial = null;
+      }
+    }
+
+    if (index >= keys.length && !partial) {
       const centralStart = writer.offset;
       let centralSize = 0;
       for (const e of central) {
@@ -444,6 +465,7 @@ async function tickJob(env: Env): Promise<ArchiveJob> {
       partNumber: writer.partNumber,
       zipOffset: writer.offset,
       central,
+      partial,
       zipKey: env.ARCHIVE_ZIP_KEY,
     };
     await writeJob(env, running);
