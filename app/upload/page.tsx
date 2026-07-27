@@ -19,7 +19,7 @@ interface Item {
 }
 
 const CONCURRENCY = 3;
-const MAX_VIDEO_BYTES = 100 * 1024 * 1024; // 100 MB
+const MAX_VIDEO_BYTES = 400 * 1024 * 1024; // ~1 dk telefon videosu için
 
 const VIDEO_TYPES = new Set([
   "video/mp4",
@@ -135,7 +135,7 @@ export default function UploadPage() {
         continue;
       }
       if (media.kind === "video" && file.size > MAX_VIDEO_BYTES) {
-        skipped.push(`${file.name} (max 100 MB)`);
+        skipped.push(`${file.name} (max 400 MB)`);
         continue;
       }
       // HEIC often fails in browsers for compression preview; still try as image/jpeg pipeline
@@ -350,7 +350,7 @@ export default function UploadPage() {
           <div className="dropzone-emoji">📸</div>
           <p className="dropzone-title">Fotoğraf veya video seç</p>
           <p className="dropzone-sub">
-            Birden fazla seçebilirsiniz · Videolar en fazla 100 MB
+            Birden fazla seçebilirsiniz · Videolar en fazla 400 MB
           </p>
         </label>
 
