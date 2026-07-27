@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import TabBar from "../components/TabBar";
+import VideoThumb from "../components/VideoThumb";
 
 interface Photo {
   key: string;
@@ -203,18 +204,11 @@ export default function GalleryPage() {
           <div className="masonry">
             {photos.map((p) =>
               isVideoKey(p.key) ? (
-                <button
+                <VideoThumb
                   key={p.key}
-                  type="button"
-                  className="masonry-video"
-                  onClick={() => setActive(p)}
-                  aria-label="Videoyu aç"
-                >
-                  <video src={p.url} muted playsInline preload="metadata" />
-                  <span className="media-badge" aria-hidden="true">
-                    ▶
-                  </span>
-                </button>
+                  url={p.url}
+                  onOpen={() => setActive(p)}
+                />
               ) : (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img

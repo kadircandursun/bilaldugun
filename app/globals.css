@@ -585,17 +585,37 @@ button {
   width: 100%;
   padding: 0;
   border: 0;
-  background: var(--bg-2);
+  background: #2a2a28;
   border-radius: 12px;
   overflow: hidden;
   break-inside: avoid;
   cursor: pointer;
 }
-.masonry-video video {
+.masonry-video video,
+.masonry-video-el,
+.masonry-video-poster {
   width: 100%;
   display: block;
   aspect-ratio: 1;
   object-fit: cover;
+  background: #2a2a28;
+}
+.masonry-video-el {
+  opacity: 0;
+}
+.masonry-video-el.is-ready {
+  opacity: 1;
+}
+.masonry-video-skeleton {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, #2a2a28 30%, #3a3a38 50%, #2a2a28 70%);
+  background-size: 200% 100%;
+  animation: skeleton-shine 1.2s ease-in-out infinite;
+}
+@keyframes skeleton-shine {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
 }
 .success-actions {
   flex-direction: column;
