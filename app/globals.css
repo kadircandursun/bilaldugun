@@ -1189,6 +1189,43 @@ button {
   text-align: left;
 }
 
+
+/* Gallery phone archive panel */
+.archive-panel {
+  margin-bottom: 20px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.archive-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.archive-hint {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.archive-status {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.archive-status.done {
+  color: #2f6b4f;
+}
+.archive-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .lock-guest {
   max-width: 340px;
   margin: 24px auto 0;

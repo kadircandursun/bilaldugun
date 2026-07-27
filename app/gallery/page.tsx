@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import TabBar from "../components/TabBar";
 import VideoThumb from "../components/VideoThumb";
@@ -10,8 +10,25 @@ interface Photo {
   url: string;
 }
 
+interface ArchiveJob {
+  status: "queued" | "running" | "ready" | "failed";
+  progressDone: number;
+  progressTotal: number;
+  size: number;
+  error?: string;
+  updatedAt: string;
+  zipKey?: string;
+}
+
 function isVideoKey(key: string) {
   return /\.(mp4|mov|webm|m4v)(\?|$)/i.test(key);
+}
+
+function formatBytes(n: number) {
+  if (!n || n <= 0) return "";
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 const STORAGE_KEY = "gallery-password";
@@ -27,6 +44,29 @@ export default function GalleryPage() {
   const [configured, setConfigured] = useState(true);
   const [active, setActive] = useState<Photo | null>(null);
   const [hydrated, setHydrated] = useState(false);
+
+  const [archiveJob, setArchiveJob] = useState<ArchiveJob | null>(null);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveMsg, setArchiveMsg] = useState<string | null>(null);
+
+  const galleryHeaders = useCallback(
+    () => ({ "x-gallery-password": password }),
+    [password]
+  );
+
+  async function loadArchiveStatus(pw: string) {
+    try {
+      const res = await fetch("/api/archive", {
+        cache: "no-store",
+        headers: { "x-gallery-password": pw },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setArchiveJob(data.job || null);
+    } catch {
+      /* ignore */
+    }
+  }
 
   async function load(pw: string) {
     setLoading(true);
@@ -44,6 +84,7 @@ export default function GalleryPage() {
       const data = await res.json();
       setPhotos(data.photos || []);
       setConfigured(data.configured !== false);
+      await loadArchiveStatus(pw);
     } catch {
       setPhotos([]);
     } finally {
@@ -59,7 +100,20 @@ export default function GalleryPage() {
       load(saved);
     }
     setHydrated(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!unlocked || !password) return;
+    const activeJob =
+      archiveJob?.status === "queued" || archiveJob?.status === "running";
+    if (!activeJob) return;
+
+    const id = window.setInterval(() => {
+      loadArchiveStatus(password);
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [unlocked, password, archiveJob?.status]);
 
   async function onUnlock(e: FormEvent) {
     e.preventDefault();
@@ -92,6 +146,72 @@ export default function GalleryPage() {
     setPhotos([]);
     setPassword("");
     setActive(null);
+    setArchiveJob(null);
+    setArchiveMsg(null);
+  }
+
+  async function startArchive() {
+    setArchiveMsg(null);
+    setArchiveBusy(true);
+    try {
+      const res = await fetch("/api/archive", {
+        method: "POST",
+        headers: galleryHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setArchiveMsg(data.error || "Arşiv başlatılamadı.");
+        if (data.job) setArchiveJob(data.job);
+        return;
+      }
+      setArchiveJob(data.job || null);
+    } catch {
+      setArchiveMsg("Bağlantı hatası.");
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
+
+  async function downloadArchive() {
+    setArchiveMsg(null);
+    setArchiveBusy(true);
+    try {
+      const res = await fetch("/api/archive/download", {
+        headers: galleryHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.url) {
+        setArchiveMsg(data.error || "İndirme linki alınamadı.");
+        return;
+      }
+      window.location.href = data.url;
+    } catch {
+      setArchiveMsg("İndirme başlatılamadı.");
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
+
+  async function deleteArchive() {
+    setArchiveMsg(null);
+    setArchiveBusy(true);
+    try {
+      const res = await fetch("/api/archive", {
+        method: "DELETE",
+        headers: galleryHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setArchiveMsg(data.error || "Silinemedi.");
+        return;
+      }
+      setArchiveJob(null);
+      setArchiveMsg("Arşiv silindi.");
+    } catch {
+      setArchiveMsg("Silme başarısız.");
+    } finally {
+      setArchiveBusy(false);
+    }
   }
 
   if (!hydrated) {
@@ -160,6 +280,9 @@ export default function GalleryPage() {
     );
   }
 
+  const archiveRunning =
+    archiveJob?.status === "queued" || archiveJob?.status === "running";
+
   return (
     <main className="shell with-bar">
       <div className="topbar">
@@ -181,6 +304,86 @@ export default function GalleryPage() {
       </div>
 
       <div className="pad" style={{ paddingTop: 16 }}>
+        {photos.length > 0 && (
+          <div className="archive-panel">
+            <p className="archive-title">Telefona yedek</p>
+            <p className="archive-hint">
+              Tüm anıları tek zip olarak hazırlayıp indirin. Hazır olunca
+              Dosyalar&apos;a kaydedin; indirdikten sonra arşivi silin.
+            </p>
+
+            {archiveRunning && (
+              <p className="archive-status">
+                Hazırlanıyor…
+                {archiveJob.progressTotal > 0
+                  ? ` ${archiveJob.progressDone}/${archiveJob.progressTotal}`
+                  : ""}
+                {archiveJob.size > 0 ? ` · ${formatBytes(archiveJob.size)}` : ""}
+              </p>
+            )}
+
+            {archiveJob?.status === "ready" && (
+              <p className="archive-status done">
+                Hazır{archiveJob.size ? ` · ${formatBytes(archiveJob.size)}` : ""}
+              </p>
+            )}
+
+            {archiveJob?.status === "failed" && (
+              <div className="notice notice-error">
+                {archiveJob.error || "Arşiv oluşturulamadı."}
+              </div>
+            )}
+
+            {archiveMsg && (
+              <div
+                className={
+                  archiveMsg.includes("silindi")
+                    ? "notice notice-info"
+                    : "notice notice-error"
+                }
+              >
+                {archiveMsg}
+              </div>
+            )}
+
+            <div className="archive-actions">
+              {archiveJob?.status === "ready" ? (
+                <>
+                  <button
+                    className="btn btn-primary btn-block"
+                    onClick={downloadArchive}
+                    disabled={archiveBusy}
+                  >
+                    Zip indir
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-block"
+                    onClick={deleteArchive}
+                    disabled={archiveBusy}
+                  >
+                    Arşivi sil
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-block"
+                    onClick={startArchive}
+                    disabled={archiveBusy}
+                  >
+                    Yeniden hazırla
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="btn btn-primary btn-block"
+                  onClick={startArchive}
+                  disabled={archiveBusy || archiveRunning}
+                >
+                  {archiveRunning ? "Hazırlanıyor…" : "Arşivi hazırla"}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {loading && <div className="empty">Yükleniyor…</div>}
 
         {!loading && !configured && (

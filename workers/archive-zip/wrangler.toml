@@ -1,0 +1,14 @@
+name = "irem-bilal-archive-zip"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "irem-bilal-dugun"
+
+[vars]
+UPLOAD_PREFIX = "uploads/"
+ARCHIVE_ZIP_KEY = "archives/latest.zip"
+ARCHIVE_JOB_KEY = "archives/job.json"
+MAX_ARCHIVE_BYTES = "8589934592"

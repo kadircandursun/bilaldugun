@@ -1,0 +1,17 @@
+{
+  "name": "irem-bilal-archive-zip",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260722.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.24.0"
+  }
+}

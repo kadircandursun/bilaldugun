@@ -7,6 +7,10 @@ export const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace
 );
 export const GALLERY_PASSWORD = process.env.GALLERY_PASSWORD || "";
 export const UPLOAD_PREFIX = "uploads/";
+export const ARCHIVE_PREFIX = "archives/";
+export const ARCHIVE_ZIP_KEY = "archives/latest.zip";
+export const ARCHIVE_JOB_KEY = "archives/job.json";
+export const MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024;
 
 export function isR2Configured(): boolean {
   return Boolean(

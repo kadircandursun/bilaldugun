@@ -1,4 +1,5 @@
 /node_modules
+**/node_modules
 /.next
 /out
 /build
@@ -9,3 +10,5 @@
 .vercel
 *.tsbuildinfo
 next-env.d.ts
+workers/**/.wrangler
+workers/**/dist

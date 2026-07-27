@@ -6,9 +6,9 @@ doğrudan Cloudflare R2'ye (S3 uyumlu, egress ücretsiz object storage) yükleni
 
 ## Özellikler
 - Aşırı mobil öncelikli tasarım (QR ile tek dokunuşla giriş)
-- Toplu fotoğraf yükleme: çoklu seçim, sıkıştırma, eş zamanlı kuyruk, dosya
-  bazlı ilerleme, hatalarda tekrar dene
+- Toplu fotoğraf/video yükleme
 - Misafir galerisi (lazy load + lightbox)
+- Galeriden telefona toplu zip yedek (Cloudflare Worker + R2)
 - Basılabilir QR kod sayfası (`/qr`)
 - Düğün bilgileri ve çift fotoğrafları ana sayfada (`lib/site.ts` ile düzenlenir)
 
@@ -48,3 +48,10 @@ değiştir ve `lib/site.ts` içindeki uzantıları güncelle. Detay:
 ## Deploy
 Vercel önerilir: repoyu bağla, environment variable'ları ekle, deploy et.
 Sonra `/qr` sayfasından QR'ı yazdır.
+
+### Telefona zip yedek (Worker)
+1. `workers/archive-zip` içinde `npm install` → `npx wrangler login` →
+   `npx wrangler secret put ARCHIVE_SECRET` → `npx wrangler deploy`
+2. Vercel'e ekle: `ARCHIVE_WORKER_URL`, `ARCHIVE_SECRET` (aynı secret)
+3. Redeploy. Galeri → **Arşivi hazırla** → **Zip indir** → **Arşivi sil**
+   Detay: `workers/archive-zip/README.md`
