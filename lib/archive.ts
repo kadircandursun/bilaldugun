@@ -111,3 +111,18 @@ export async function triggerArchiveWorker(): Promise<{
 
   return { ok: true, job: data.job };
 }
+
+export async function tickArchiveWorker(): Promise<ArchiveJob | null> {
+  const workerUrl = process.env.ARCHIVE_WORKER_URL;
+  const secret = process.env.ARCHIVE_SECRET;
+  if (!workerUrl || !secret) return null;
+
+  const base = workerUrl.replace(/\/$/, "");
+  const res = await fetch(`${base}/tick`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${secret}` },
+  });
+  if (!res.ok) return null;
+  const data = (await res.json().catch(() => ({}))) as { job?: ArchiveJob };
+  return data.job || null;
+}

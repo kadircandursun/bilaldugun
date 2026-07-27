@@ -1,4 +1,8 @@
-import { Zip, ZipPassThrough } from "fflate";
+/**
+ * Tick-based ZIP (STORE) builder for Cloudflare Workers.
+ * Each /tick processes a few files, persists multipart state in R2, then returns.
+ * Gallery polling drives ticks until status=ready.
+ */
 
 export interface Env {
   BUCKET: R2Bucket;
@@ -9,9 +13,16 @@ export interface Env {
   MAX_ARCHIVE_BYTES: string;
 }
 
-export type JobStatus = "queued" | "running" | "ready" | "failed";
+type JobStatus = "queued" | "running" | "ready" | "failed";
 
-export interface ArchiveJob {
+interface CentralEntry {
+  name: string;
+  crc: number;
+  size: number;
+  offset: number;
+}
+
+interface ArchiveJob {
   status: JobStatus;
   progressDone: number;
   progressTotal: number;
@@ -19,6 +30,118 @@ export interface ArchiveJob {
   error?: string;
   updatedAt: string;
   zipKey?: string;
+  keys?: string[];
+  nextIndex?: number;
+  uploadId?: string;
+  parts?: { partNumber: number; etag: string }[];
+  partNumber?: number;
+  zipOffset?: number;
+  central?: CentralEntry[];
+}
+
+const PART_BUF_KEY = "archives/_partbuf.bin";
+const MIN_PART = 5 * 1024 * 1024;
+const FILES_PER_TICK = 1;
+const BYTES_PER_TICK = 512 * 1024 * 1024;
+const CRC_MAX_BYTES = 8 * 1024 * 1024;
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32Update(crc: number, data: Uint8Array): number {
+  let c = crc ^ 0xffffffff;
+  for (let i = 0; i < data.length; i++) {
+    c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function u16(n: number) {
+  const b = new Uint8Array(2);
+  new DataView(b.buffer).setUint16(0, n, true);
+  return b;
+}
+
+function u32(n: number) {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n >>> 0, true);
+  return b;
+}
+
+function concat(chunks: Uint8Array[]) {
+  const len = chunks.reduce((s, c) => s + c.length, 0);
+  const out = new Uint8Array(len);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
+function localHeader(nameBytes: Uint8Array) {
+  // GP flag bit3 = data descriptor; method 0 = STORE
+  return concat([
+    u32(0x04034b50),
+    u16(20),
+    u16(0x0008),
+    u16(0),
+    u16(0),
+    u16(0),
+    u32(0),
+    u32(0),
+    u32(0),
+    u16(nameBytes.length),
+    u16(0),
+    nameBytes,
+  ]);
+}
+
+function dataDescriptor(crc: number, size: number) {
+  return concat([u32(0x08074b50), u32(crc), u32(size), u32(size)]);
+}
+
+function centralHeader(e: CentralEntry, nameBytes: Uint8Array) {
+  return concat([
+    u32(0x02014b50),
+    u16(20),
+    u16(20),
+    u16(0x0008),
+    u16(0),
+    u16(0),
+    u16(0),
+    u32(e.crc),
+    u32(e.size),
+    u32(e.size),
+    u16(nameBytes.length),
+    u16(0),
+    u16(0),
+    u16(0),
+    u16(0),
+    u32(0),
+    u32(e.offset),
+    nameBytes,
+  ]);
+}
+
+function endOfCentral(centralSize: number, centralOffset: number, count: number) {
+  return concat([
+    u32(0x06054b50),
+    u16(0),
+    u16(0),
+    u16(count),
+    u16(count),
+    u32(centralSize),
+    u32(centralOffset),
+    u16(0),
+  ]);
 }
 
 function jsonResponse(data: unknown, status = 200) {
@@ -28,14 +151,9 @@ function jsonResponse(data: unknown, status = 200) {
   });
 }
 
-function unauthorized() {
-  return jsonResponse({ error: "Unauthorized" }, 401);
-}
-
-function isAuthorized(req: Request, env: Env): boolean {
+function isAuthorized(req: Request, env: Env) {
   const header = req.headers.get("Authorization") || "";
-  const expected = `Bearer ${env.ARCHIVE_SECRET}`;
-  return Boolean(env.ARCHIVE_SECRET) && header === expected;
+  return Boolean(env.ARCHIVE_SECRET) && header === `Bearer ${env.ARCHIVE_SECRET}`;
 }
 
 async function writeJob(env: Env, job: ArchiveJob) {
@@ -54,8 +172,8 @@ async function readJob(env: Env): Promise<ArchiveJob | null> {
   }
 }
 
-async function listUploads(env: Env) {
-  const objects: R2Object[] = [];
+async function listUploadKeys(env: Env) {
+  const keys: string[] = [];
   let cursor: string | undefined;
   do {
     const page = await env.BUCKET.list({
@@ -64,145 +182,298 @@ async function listUploads(env: Env) {
       limit: 1000,
     });
     for (const o of page.objects) {
-      if (o.key === env.UPLOAD_PREFIX) continue;
-      objects.push(o);
+      if (o.key !== env.UPLOAD_PREFIX) keys.push(o.key);
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
-  return objects;
+  return keys;
 }
 
-async function buildArchive(env: Env) {
-  const started: ArchiveJob = {
-    status: "running",
-    progressDone: 0,
-    progressTotal: 0,
-    size: 0,
-    updatedAt: new Date().toISOString(),
-  };
-  await writeJob(env, started);
+class PartWriter {
+  private buf = new Uint8Array(0);
+  parts: { partNumber: number; etag: string }[] = [];
+  partNumber: number;
+  offset: number;
+  uploadId: string;
+  key: string;
+  bucket: R2Bucket;
 
-  try {
-    const objects = await listUploads(env);
-    const totalBytes = objects.reduce((sum, o) => sum + (o.size || 0), 0);
-    const maxBytes = Number(env.MAX_ARCHIVE_BYTES) || 8 * 1024 * 1024 * 1024;
+  constructor(
+    bucket: R2Bucket,
+    key: string,
+    uploadId: string,
+    parts: { partNumber: number; etag: string }[],
+    partNumber: number,
+    offset: number,
+    initialBuf: Uint8Array
+  ) {
+    this.bucket = bucket;
+    this.key = key;
+    this.uploadId = uploadId;
+    this.parts = parts;
+    this.partNumber = partNumber;
+    this.offset = offset;
+    this.buf = initialBuf;
+  }
 
-    if (objects.length === 0) {
-      await writeJob(env, {
-        status: "failed",
-        progressDone: 0,
-        progressTotal: 0,
-        size: 0,
-        error: "Yuklenecek anı yok.",
-        updatedAt: new Date().toISOString(),
-      });
-      return;
+  async write(chunk: Uint8Array) {
+    if (!chunk.length) return;
+    const merged = new Uint8Array(this.buf.length + chunk.length);
+    merged.set(this.buf);
+    merged.set(chunk, this.buf.length);
+    this.buf = merged;
+    this.offset += chunk.length;
+
+    while (this.buf.length >= MIN_PART) {
+      const part = this.buf.slice(0, MIN_PART);
+      this.buf = this.buf.slice(MIN_PART);
+      this.partNumber += 1;
+      const res = await this.bucket.resumeMultipartUpload(this.key, this.uploadId).uploadPart(
+        this.partNumber,
+        part
+      );
+      this.parts.push({ partNumber: this.partNumber, etag: res.etag });
     }
+  }
 
-    if (totalBytes > maxBytes) {
-      await writeJob(env, {
-        status: "failed",
-        progressDone: 0,
-        progressTotal: objects.length,
-        size: totalBytes,
-        error: "Arsiv 8 GB ustunde; R2/telefon icin cok buyuk.",
-        updatedAt: new Date().toISOString(),
-      });
-      return;
+  async flushFinal() {
+    if (this.buf.length > 0 || this.parts.length === 0) {
+      this.partNumber += 1;
+      const res = await this.bucket.resumeMultipartUpload(this.key, this.uploadId).uploadPart(
+        this.partNumber,
+        this.buf.length ? this.buf : new Uint8Array([0])
+      );
+      this.parts.push({ partNumber: this.partNumber, etag: res.etag });
+      this.buf = new Uint8Array(0);
     }
+    await this.bucket.resumeMultipartUpload(this.key, this.uploadId).complete(
+      this.parts.map((p) => ({ partNumber: p.partNumber, etag: p.etag }))
+    );
+  }
 
-    await writeJob(env, {
-      status: "running",
-      progressDone: 0,
-      progressTotal: objects.length,
-      size: totalBytes,
-      updatedAt: new Date().toISOString(),
-    });
-
-    const { readable, writable } = new TransformStream<Uint8Array>();
-    const writer = writable.getWriter();
-
-    let zipError: Error | null = null;
-    let writeChain: Promise<void> = Promise.resolve();
-
-    const zip = new Zip((err, data, final) => {
-      if (err) {
-        zipError = err;
-        writeChain = writeChain.then(() => writer.abort(err)).catch(() => undefined);
-        return;
-      }
-      writeChain = writeChain.then(() => writer.write(data));
-      if (final) {
-        writeChain = writeChain.then(() => writer.close());
-      }
-    });
-
-    const putPromise = env.BUCKET.put(env.ARCHIVE_ZIP_KEY, readable, {
-      httpMetadata: { contentType: "application/zip" },
-    });
-
-    let done = 0;
-    for (const obj of objects) {
-      const file = await env.BUCKET.get(obj.key);
-      if (!file || !file.body) {
-        done += 1;
-        continue;
-      }
-
-      const name = obj.key.slice(env.UPLOAD_PREFIX.length) || obj.key;
-      const entry = new ZipPassThrough(name);
-      zip.add(entry);
-
-      const reader = file.body.getReader();
-      while (true) {
-        const { value, done: streamDone } = await reader.read();
-        if (streamDone) break;
-        if (value) entry.push(value);
-      }
-      entry.push(new Uint8Array(0), true);
-
-      done += 1;
-      if (done % 3 === 0 || done === objects.length) {
-        await writeJob(env, {
-          status: "running",
-          progressDone: done,
-          progressTotal: objects.length,
-          size: totalBytes,
-          updatedAt: new Date().toISOString(),
-        });
-      }
+  async persistBuf(env: Env) {
+    if (this.buf.length) {
+      await env.BUCKET.put(PART_BUF_KEY, this.buf);
+    } else {
+      await env.BUCKET.delete(PART_BUF_KEY);
     }
+  }
+}
 
-    zip.end();
-    await writeChain;
-    await putPromise;
+async function loadPartBuf(env: Env): Promise<Uint8Array> {
+  const obj = await env.BUCKET.get(PART_BUF_KEY);
+  if (!obj) return new Uint8Array(0);
+  return new Uint8Array(await obj.arrayBuffer());
+}
 
-    if (zipError) throw zipError;
+async function startJob(env: Env): Promise<ArchiveJob> {
+  const keys = await listUploadKeys(env);
+  let totalBytes = 0;
+  for (const key of keys) {
+    const h = await env.BUCKET.head(key);
+    totalBytes += h?.size || 0;
+  }
+  const maxBytes = Number(env.MAX_ARCHIVE_BYTES) || 8 * 1024 * 1024 * 1024;
 
-    const zipObj = await env.BUCKET.head(env.ARCHIVE_ZIP_KEY);
-    await writeJob(env, {
-      status: "ready",
-      progressDone: objects.length,
-      progressTotal: objects.length,
-      size: zipObj?.size || totalBytes,
-      zipKey: env.ARCHIVE_ZIP_KEY,
-      updatedAt: new Date().toISOString(),
-    });
-  } catch (e) {
-    await writeJob(env, {
+  if (keys.length === 0) {
+    const failed: ArchiveJob = {
       status: "failed",
       progressDone: 0,
       progressTotal: 0,
       size: 0,
-      error: e instanceof Error ? e.message : "Arsiv olusturulamadi.",
+      error: "Yuklenecek ani yok.",
       updatedAt: new Date().toISOString(),
-    });
+    };
+    await writeJob(env, failed);
+    return failed;
+  }
+
+  if (totalBytes > maxBytes) {
+    const failed: ArchiveJob = {
+      status: "failed",
+      progressDone: 0,
+      progressTotal: keys.length,
+      size: totalBytes,
+      error: "Arsiv 8 GB ustunde; R2/telefon icin cok buyuk.",
+      updatedAt: new Date().toISOString(),
+    };
+    await writeJob(env, failed);
+    return failed;
+  }
+
+  try {
+    await env.BUCKET.delete(env.ARCHIVE_ZIP_KEY);
+  } catch {
+    /* ignore */
+  }
+  await env.BUCKET.delete(PART_BUF_KEY);
+
+  const multi = await env.BUCKET.createMultipartUpload(env.ARCHIVE_ZIP_KEY, {
+    httpMetadata: { contentType: "application/zip" },
+  });
+
+  const job: ArchiveJob = {
+    status: "running",
+    progressDone: 0,
+    progressTotal: keys.length,
+    size: totalBytes,
+    updatedAt: new Date().toISOString(),
+    keys,
+    nextIndex: 0,
+    uploadId: multi.uploadId,
+    parts: [],
+    partNumber: 0,
+    zipOffset: 0,
+    central: [],
+    zipKey: env.ARCHIVE_ZIP_KEY,
+  };
+  await writeJob(env, job);
+  return job;
+}
+
+async function tickJob(env: Env): Promise<ArchiveJob> {
+  let job = await readJob(env);
+  if (!job) {
+    return {
+      status: "failed",
+      progressDone: 0,
+      progressTotal: 0,
+      size: 0,
+      error: "Job yok.",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (job.status === "ready" || job.status === "failed") return job;
+  if (job.status === "queued" || !job.uploadId || !job.keys) {
+    job = await startJob(env);
+    if (job.status !== "running") return job;
+  }
+
+  const keys = job.keys || [];
+  let index = job.nextIndex || 0;
+  const central = job.central || [];
+  const initialBuf = await loadPartBuf(env);
+
+  const writer = new PartWriter(
+    env.BUCKET,
+    env.ARCHIVE_ZIP_KEY,
+    job.uploadId!,
+    job.parts || [],
+    job.partNumber || 0,
+    job.zipOffset || 0,
+    initialBuf
+  );
+
+  let filesThisTick = 0;
+  let bytesThisTick = 0;
+
+  try {
+    while (index < keys.length && filesThisTick < FILES_PER_TICK && bytesThisTick < BYTES_PER_TICK) {
+      const key = keys[index];
+      const file = await env.BUCKET.get(key);
+      const name = key.slice(env.UPLOAD_PREFIX.length) || key;
+      const nameBytes = new TextEncoder().encode(name);
+
+      if (!file || !file.body) {
+        index += 1;
+        filesThisTick += 1;
+        continue;
+      }
+
+      const offset = writer.offset;
+      await writer.write(localHeader(nameBytes));
+
+      let crc = 0;
+      let size = 0;
+      const computeCrc = (file.size || 0) <= CRC_MAX_BYTES;
+      const reader = file.body.getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        if (computeCrc) crc = crc32Update(crc, value);
+        size += value.length;
+        bytesThisTick += value.length;
+        await writer.write(value);
+      }
+
+      await writer.write(dataDescriptor(crc, size));
+      central.push({ name, crc, size, offset });
+
+      index += 1;
+      filesThisTick += 1;
+    }
+
+    if (index >= keys.length) {
+      const centralStart = writer.offset;
+      let centralSize = 0;
+      for (const e of central) {
+        const nameBytes = new TextEncoder().encode(e.name);
+        const hdr = centralHeader(e, nameBytes);
+        centralSize += hdr.length;
+        await writer.write(hdr);
+      }
+      await writer.write(endOfCentral(centralSize, centralStart, central.length));
+      await writer.flushFinal();
+      await env.BUCKET.delete(PART_BUF_KEY);
+
+      const head = await env.BUCKET.head(env.ARCHIVE_ZIP_KEY);
+      const ready: ArchiveJob = {
+        status: "ready",
+        progressDone: keys.length,
+        progressTotal: keys.length,
+        size: head?.size || writer.offset,
+        updatedAt: new Date().toISOString(),
+        zipKey: env.ARCHIVE_ZIP_KEY,
+      };
+      await writeJob(env, ready);
+      return ready;
+    }
+
+    await writer.persistBuf(env);
+    const running: ArchiveJob = {
+      status: "running",
+      progressDone: index,
+      progressTotal: keys.length,
+      size: job.size,
+      updatedAt: new Date().toISOString(),
+      keys,
+      nextIndex: index,
+      uploadId: job.uploadId,
+      parts: writer.parts,
+      partNumber: writer.partNumber,
+      zipOffset: writer.offset,
+      central,
+      zipKey: env.ARCHIVE_ZIP_KEY,
+    };
+    await writeJob(env, running);
+    return running;
+  } catch (e) {
+    try {
+      if (job.uploadId) {
+        await env.BUCKET.resumeMultipartUpload(env.ARCHIVE_ZIP_KEY, job.uploadId).abort();
+      }
+    } catch {
+      /* ignore */
+    }
+    const failed: ArchiveJob = {
+      status: "failed",
+      progressDone: index,
+      progressTotal: keys.length,
+      size: job.size,
+      error: e instanceof Error ? e.message : "Arsiv hatasi",
+      updatedAt: new Date().toISOString(),
+    };
+    await writeJob(env, failed);
+    return failed;
   }
 }
 
 export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (!isAuthorized(req, env)) return unauthorized();
+  async fetch(req: Request, env: Env): Promise<Response> {
+    if (!isAuthorized(req, env)) {
+      return jsonResponse({ error: "Unauthorized" }, 401);
+    }
 
     const url = new URL(req.url);
 
@@ -211,26 +482,27 @@ export default {
     }
 
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/status")) {
-      const job = await readJob(env);
-      return jsonResponse({ job });
+      return jsonResponse({ job: await readJob(env) });
     }
 
     if (req.method === "POST" && (url.pathname === "/" || url.pathname === "/start")) {
       const existing = await readJob(env);
-      if (existing?.status === "running" || existing?.status === "queued") {
-        return jsonResponse({ ok: true, job: existing, started: false });
+      if (existing?.status === "running") {
+        // Drive progress on each start/tick from Next poll
+        const job = await tickJob(env);
+        return jsonResponse({ ok: true, job, started: false });
       }
+      const job = await startJob(env);
+      if (job.status === "running") {
+        const progressed = await tickJob(env);
+        return jsonResponse({ ok: true, job: progressed, started: true }, 202);
+      }
+      return jsonResponse({ ok: true, job, started: true }, 202);
+    }
 
-      const queued: ArchiveJob = {
-        status: "queued",
-        progressDone: 0,
-        progressTotal: 0,
-        size: 0,
-        updatedAt: new Date().toISOString(),
-      };
-      await writeJob(env, queued);
-      ctx.waitUntil(buildArchive(env));
-      return jsonResponse({ ok: true, job: queued, started: true }, 202);
+    if (req.method === "POST" && url.pathname === "/tick") {
+      const job = await tickJob(env);
+      return jsonResponse({ ok: true, job });
     }
 
     return jsonResponse({ error: "Not found" }, 404);

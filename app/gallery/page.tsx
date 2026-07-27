@@ -111,7 +111,7 @@ export default function GalleryPage() {
 
     const id = window.setInterval(() => {
       loadArchiveStatus(password);
-    }, 4000);
+    }, 2500);
     return () => window.clearInterval(id);
   }, [unlocked, password, archiveJob?.status]);
 

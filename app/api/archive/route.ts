@@ -3,6 +3,7 @@ import {
   isGalleryAuthorized,
   readArchiveJob,
   triggerArchiveWorker,
+  tickArchiveWorker,
   deleteArchiveArtifacts,
   writeArchiveJob,
   type ArchiveJob,
@@ -11,6 +12,7 @@ import { isR2Configured } from "@/lib/r2";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function GET(req: Request) {
   if (!isGalleryAuthorized(req)) {
@@ -19,7 +21,14 @@ export async function GET(req: Request) {
   if (!isR2Configured()) {
     return NextResponse.json({ job: null, configured: false });
   }
-  const job = await readArchiveJob();
+
+  let job = await readArchiveJob();
+  if (job?.status === "running" || job?.status === "queued") {
+    const ticked = await tickArchiveWorker();
+    if (ticked) job = ticked;
+    else job = await readArchiveJob();
+  }
+
   return NextResponse.json({ job, configured: true });
 }
 

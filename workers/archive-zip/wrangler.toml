@@ -1,7 +1,6 @@
 name = "irem-bilal-archive-zip"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"
-compatibility_flags = ["nodejs_compat"]
 
 [[r2_buckets]]
 binding = "BUCKET"
