@@ -5,23 +5,57 @@ import Link from "next/link";
 import imageCompression from "browser-image-compression";
 
 type Status = "pending" | "compressing" | "uploading" | "done" | "error";
+type Kind = "image" | "video";
 
 interface Item {
   id: string;
   file: File;
   previewUrl: string;
+  kind: Kind;
+  contentType: string;
   status: Status;
   progress: number;
   error?: string;
 }
 
 const CONCURRENCY = 3;
+const MAX_VIDEO_BYTES = 100 * 1024 * 1024; // 100 MB
+
+const VIDEO_TYPES = new Set([
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+  "video/x-m4v",
+]);
 
 function newId() {
   return (
     (globalThis.crypto?.randomUUID?.() as string) ||
     `${Date.now()}-${Math.random().toString(36).slice(2)}`
   );
+}
+
+function resolveMedia(file: File): { kind: Kind; contentType: string } | null {
+  const name = file.name.toLowerCase();
+  const type = (file.type || "").toLowerCase();
+
+  if (type.startsWith("image/") || /\.(jpe?g|png|webp|heic|heif)$/i.test(name)) {
+    // Upload pipeline converts images to jpeg
+    if (type === "image/png" || type === "image/webp") {
+      return { kind: "image", contentType: type };
+    }
+    return { kind: "image", contentType: "image/jpeg" };
+  }
+
+  if (type.startsWith("video/") || /\.(mp4|mov|webm|m4v)$/i.test(name)) {
+    if (VIDEO_TYPES.has(type)) return { kind: "video", contentType: type };
+    if (name.endsWith(".mov")) return { kind: "video", contentType: "video/quicktime" };
+    if (name.endsWith(".webm")) return { kind: "video", contentType: "video/webm" };
+    if (name.endsWith(".m4v")) return { kind: "video", contentType: "video/x-m4v" };
+    return { kind: "video", contentType: "video/mp4" };
+  }
+
+  return null;
 }
 
 function putWithProgress(
@@ -46,6 +80,28 @@ function putWithProgress(
   });
 }
 
+function MediaThumb({
+  item,
+  className,
+}: {
+  item: Pick<Item, "kind" | "previewUrl">;
+  className: string;
+}) {
+  if (item.kind === "video") {
+    return (
+      <video
+        className={className}
+        src={item.previewUrl}
+        muted
+        playsInline
+        preload="metadata"
+      />
+    );
+  }
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img className={className} src={item.previewUrl} alt="" />;
+}
+
 export default function UploadPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [running, setRunning] = useState(false);
@@ -67,18 +123,48 @@ export default function UploadPage() {
   function onSelect(files: FileList | null) {
     if (!files || files.length === 0) return;
     setShowSuccess(false);
+    setNotice(null);
+
     const next: Item[] = [];
+    const skipped: string[] = [];
+
     for (const file of Array.from(files)) {
-      if (!file.type.startsWith("image/")) continue;
+      const media = resolveMedia(file);
+      if (!media) {
+        skipped.push(file.name);
+        continue;
+      }
+      if (media.kind === "video" && file.size > MAX_VIDEO_BYTES) {
+        skipped.push(`${file.name} (max 100 MB)`);
+        continue;
+      }
+      // HEIC often fails in browsers for compression preview; still try as image/jpeg pipeline
+      if (
+        media.kind === "image" &&
+        (file.type === "image/heic" ||
+          file.type === "image/heif" ||
+          /\.heic$/i.test(file.name))
+      ) {
+        // Keep as image; compression lib may fail — user gets error per file
+      }
+
       next.push({
         id: newId(),
         file,
         previewUrl: URL.createObjectURL(file),
+        kind: media.kind,
+        contentType: media.contentType,
         status: "pending",
         progress: 0,
       });
     }
-    setItems((prev) => [...prev, ...next]);
+
+    if (skipped.length > 0) {
+      setNotice(`Atlandı: ${skipped.slice(0, 3).join(", ")}${skipped.length > 3 ? "…" : ""}`);
+    }
+    if (next.length > 0) {
+      setItems((prev) => [...prev, ...next]);
+    }
   }
 
   function removeItem(id: string) {
@@ -98,19 +184,27 @@ export default function UploadPage() {
 
   async function processOne(item: Item): Promise<boolean> {
     try {
-      updateItem(item.id, { status: "compressing", progress: 0, error: undefined });
-      const compressed = await imageCompression(item.file, {
-        maxWidthOrHeight: 1920,
-        maxSizeMB: 1.5,
-        initialQuality: 0.8,
-        useWebWorker: true,
-        fileType: "image/jpeg",
-      });
+      let blob: Blob = item.file;
+      let contentType = item.contentType;
+
+      if (item.kind === "image") {
+        updateItem(item.id, { status: "compressing", progress: 0, error: undefined });
+        blob = await imageCompression(item.file, {
+          maxWidthOrHeight: 1920,
+          maxSizeMB: 1.5,
+          initialQuality: 0.8,
+          useWebWorker: true,
+          fileType: "image/jpeg",
+        });
+        contentType = "image/jpeg";
+      } else {
+        updateItem(item.id, { status: "uploading", progress: 0, error: undefined });
+      }
 
       const res = await fetch("/api/upload-url", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contentType: "image/jpeg" }),
+        body: JSON.stringify({ contentType }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -119,7 +213,7 @@ export default function UploadPage() {
       const { url } = (await res.json()) as { url: string };
 
       updateItem(item.id, { status: "uploading", progress: 0 });
-      await putWithProgress(url, compressed, "image/jpeg", (pct) =>
+      await putWithProgress(url, blob, contentType, (pct) =>
         updateItem(item.id, { progress: pct })
       );
       updateItem(item.id, { status: "done", progress: 100 });
@@ -193,19 +287,20 @@ export default function UploadPage() {
           <h2 className="success-title serif">Anı kayda geçti</h2>
           <p className="success-copy">
             {doneItems.length === 1
-              ? "1 fotoğrafınız bizimle paylaşıldı."
-              : `${doneItems.length} fotoğrafınız bizimle paylaşıldı.`}
+              ? "1 anınız bizimle paylaşıldı."
+              : `${doneItems.length} anınız bizimle paylaşıldı.`}
           </p>
 
-          <div className="success-grid" aria-label="Yüklenen fotoğraflar">
+          <div className="success-grid" aria-label="Yüklenen anılar">
             {doneItems.map((item) => (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                key={item.id}
-                className="success-thumb"
-                src={item.previewUrl}
-                alt=""
-              />
+              <div key={item.id} className="success-thumb-wrap">
+                <MediaThumb item={item} className="success-thumb" />
+                {item.kind === "video" && (
+                  <span className="media-badge" aria-hidden="true">
+                    ▶
+                  </span>
+                )}
+              </div>
             ))}
           </div>
         </div>
@@ -230,20 +325,21 @@ export default function UploadPage() {
         <Link href="/" className="back" aria-label="Geri">
           ‹
         </Link>
-        <h1>Fotoğraf Yükle</h1>
+        <h1>Anı Yükle</h1>
       </div>
 
       <div className="pad" style={{ paddingTop: 20, paddingBottom: 24 }}>
         {notice && <div className="notice notice-error">{notice}</div>}
 
         <p className="hint" style={{ marginBottom: 16 }}>
-          Düğünde çektiğiniz kareleri buradan bizimle paylaşabilirsiniz.
+          Düğünde çektiğiniz fotoğraf ve videoları buradan bizimle
+          paylaşabilirsiniz.
         </p>
 
         <label className="dropzone">
           <input
             type="file"
-            accept="image/*"
+            accept="image/*,video/*"
             multiple
             hidden
             onChange={(e) => {
@@ -252,9 +348,9 @@ export default function UploadPage() {
             }}
           />
           <div className="dropzone-emoji">📸</div>
-          <p className="dropzone-title">Fotoğrafları seç</p>
+          <p className="dropzone-title">Fotoğraf veya video seç</p>
           <p className="dropzone-sub">
-            Birden fazla fotoğraf seçebilir veya kamerayla çekebilirsiniz
+            Birden fazla seçebilirsiniz · Videolar en fazla 100 MB
           </p>
         </label>
 
@@ -270,8 +366,14 @@ export default function UploadPage() {
             <div className="queue">
               {items.map((item) => (
                 <div className="qitem" key={item.id}>
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img className="qthumb" src={item.previewUrl} alt="" />
+                  <div className="qthumb-wrap">
+                    <MediaThumb item={item} className="qthumb" />
+                    {item.kind === "video" && (
+                      <span className="media-badge tiny" aria-hidden="true">
+                        ▶
+                      </span>
+                    )}
+                  </div>
                   <div className="qmeta">
                     <div className="qname">{item.file.name}</div>
                     {(item.status === "uploading" ||

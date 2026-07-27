@@ -9,6 +9,10 @@ interface Photo {
   url: string;
 }
 
+function isVideoKey(key: string) {
+  return /\.(mp4|mov|webm|m4v)(\?|$)/i.test(key);
+}
+
 const STORAGE_KEY = "gallery-password";
 
 export default function GalleryPage() {
@@ -20,7 +24,7 @@ export default function GalleryPage() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(false);
   const [configured, setConfigured] = useState(true);
-  const [active, setActive] = useState<string | null>(null);
+  const [active, setActive] = useState<Photo | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
   async function load(pw: string) {
@@ -188,25 +192,40 @@ export default function GalleryPage() {
         {!loading && configured && photos.length === 0 && (
           <div className="empty">
             <div className="empty-emoji">🤍</div>
-            <p>Henüz fotoğraf yok. İlk kareyi sen ekle!</p>
+            <p>Henüz anı yok. İlk kareyi sen ekle!</p>
             <Link href="/upload" className="btn btn-primary">
-              Fotoğraf Yükle
+              Anı Yükle
             </Link>
           </div>
         )}
 
         {!loading && photos.length > 0 && (
           <div className="masonry">
-            {photos.map((p) => (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                key={p.key}
-                src={p.url}
-                alt="Düğün fotoğrafı"
-                loading="lazy"
-                onClick={() => setActive(p.url)}
-              />
-            ))}
+            {photos.map((p) =>
+              isVideoKey(p.key) ? (
+                <button
+                  key={p.key}
+                  type="button"
+                  className="masonry-video"
+                  onClick={() => setActive(p)}
+                  aria-label="Videoyu aç"
+                >
+                  <video src={p.url} muted playsInline preload="metadata" />
+                  <span className="media-badge" aria-hidden="true">
+                    ▶
+                  </span>
+                </button>
+              ) : (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  key={p.key}
+                  src={p.url}
+                  alt="Düğün anısı"
+                  loading="lazy"
+                  onClick={() => setActive(p)}
+                />
+              )
+            )}
           </div>
         )}
       </div>
@@ -216,8 +235,18 @@ export default function GalleryPage() {
           <button className="lightbox-close" aria-label="Kapat">
             ✕
           </button>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={active} alt="Düğün fotoğrafı" />
+          {isVideoKey(active.key) ? (
+            <video
+              src={active.url}
+              controls
+              playsInline
+              autoPlay
+              onClick={(e) => e.stopPropagation()}
+            />
+          ) : (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={active.url} alt="Düğün anısı" />
+          )}
         </div>
       )}
 

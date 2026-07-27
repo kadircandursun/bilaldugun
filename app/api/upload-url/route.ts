@@ -10,11 +10,23 @@ import {
 
 export const runtime = "nodejs";
 
-const ALLOWED = new Set(["image/jpeg", "image/png", "image/webp"]);
+const ALLOWED = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+  "video/x-m4v",
+]);
 
 function safeExt(contentType: string): string {
   if (contentType === "image/png") return "png";
   if (contentType === "image/webp") return "webp";
+  if (contentType === "video/mp4") return "mp4";
+  if (contentType === "video/quicktime") return "mov";
+  if (contentType === "video/webm") return "webm";
+  if (contentType === "video/x-m4v") return "m4v";
   return "jpg";
 }
 
@@ -36,7 +48,7 @@ export async function POST(req: Request) {
   const contentType = body.contentType || "image/jpeg";
   if (!ALLOWED.has(contentType)) {
     return NextResponse.json(
-      { error: "Sadece fotoğraf yükleyebilirsiniz." },
+      { error: "Sadece fotoğraf veya video yükleyebilirsiniz." },
       { status: 415 }
     );
   }
